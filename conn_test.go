@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -358,6 +359,185 @@ func TestConn(t *testing.T) {
 			return
 		})
 	})
+}
+
+func TestWriteMulti(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	const (
+		tcp   = "tcp"
+		kafka = "localhost:9092"
+	)
+
+	conn, err := (&Dialer{
+		Resolver: &net.Resolver{},
+	}).DialContext(ctx, tcp, kafka)
+	if err != nil {
+		t.Fatal("failed to open a new kafka connection:", err)
+	}
+	defer conn.Close()
+
+	topic1 := makeTopic()
+	topic2 := makeTopic()
+
+	err = conn.CreateTopics(
+		TopicConfig{
+			Topic:             topic1,
+			NumPartitions:     2,
+			ReplicationFactor: 1,
+		},
+		TopicConfig{
+			Topic:             topic2,
+			NumPartitions:     1,
+			ReplicationFactor: 1,
+		},
+	)
+	if err != nil {
+		t.Fatal("failed creating topics: ", err)
+	}
+
+	conn.SetWriteDeadline(time.Now().Add(time.Minute))
+
+	err = conn.WriteMulti(nil,
+		MultiProduceRequest{
+			Topic: topic1,
+			Partitions: []MultiProducePartition{
+				{
+					Partition: 0,
+					Messages: []Message{
+						{
+							Value: []byte("0.0"),
+						},
+						{
+							Value: []byte("0.1"),
+						},
+						{
+							Value: []byte("0.2"),
+						},
+					},
+				},
+				{
+					Partition: 1,
+					Messages: []Message{
+						{
+							Value: []byte("1.0"),
+						},
+						{
+							Value: []byte("1.1"),
+						},
+						{
+							Value: []byte("1.2"),
+						},
+					},
+				},
+			},
+		},
+		MultiProduceRequest{
+			Topic: topic2,
+			Partitions: []MultiProducePartition{
+				{
+					Partition: 0,
+					Messages: []Message{
+						{
+							Value: []byte("a.0"),
+						},
+						{
+							Value: []byte("b.1"),
+						},
+						{
+							Value: []byte("c.2"),
+						},
+					},
+				},
+			},
+		},
+	)
+	if err != nil {
+		t.Fatal("failed writing: ", err)
+	}
+
+	err = conn.WriteMulti(nil,
+		MultiProduceRequest{
+			Topic: topic1,
+			Partitions: []MultiProducePartition{
+				{
+					Partition: 0,
+					Messages: []Message{
+						{
+							Value: []byte("0.0"),
+						},
+						{
+							Value: []byte("0.1"),
+						},
+						{
+							Value: []byte("0.2"),
+						},
+					},
+				},
+				{
+					Partition: 5,
+					Messages: []Message{
+						{
+							Value: []byte("1.0"),
+						},
+						{
+							Value: []byte("1.1"),
+						},
+						{
+							Value: []byte("1.2"),
+						},
+					},
+				},
+			},
+		},
+		MultiProduceRequest{
+			Topic: "does-not-exist",
+			Partitions: []MultiProducePartition{
+				{
+					Partition: 0,
+					Messages: []Message{
+						{
+							Value: []byte("a.0"),
+						},
+						{
+							Value: []byte("b.1"),
+						},
+						{
+							Value: []byte("c.2"),
+						},
+					},
+				},
+			},
+		},
+	)
+	if err == nil {
+		t.Fatal("should have failed with error")
+	}
+	mpErr, ok := err.(MultiProduceError)
+	if !ok {
+		t.Fatal("should have been a multi-produce error")
+	}
+	if len(mpErr) != 2 {
+		t.Fatal("expected two errors")
+	}
+
+	// todo : need to sort or is this deterministic??
+	expected := MultiProduceError{
+		{
+			Topic:     "does-not-exist",
+			Partition: 0,
+			Error:     UnknownTopicOrPartition,
+		},
+		{
+			Topic:     topic1,
+			Partition: 5,
+			Error:     UnknownTopicOrPartition,
+		},
+	}
+	if !reflect.DeepEqual(expected, mpErr) {
+		t.Fatalf("expected %v but got %v", expected, mpErr)
+	}
 }
 
 func testConnClose(t *testing.T, conn *Conn) {

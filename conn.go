@@ -1124,6 +1124,179 @@ func (c *Conn) WriteCompressedMessagesAt(codec CompressionCodec, msgs ...Message
 	return c.writeCompressedMessages(codec, msgs...)
 }
 
+type MultiProduceRequest struct {
+	Topic      string
+	Partitions []MultiProducePartition
+}
+
+type MultiProducePartition struct {
+	Partition int32
+	Messages  []Message
+}
+
+type MultiProduceError []TopicPartitionError
+
+func (e MultiProduceError) Error() string {
+	return "make a better message" // todo
+}
+
+type TopicPartitionError struct {
+	Topic     string
+	Partition int32
+	Error     Error
+}
+
+// todo : signature.
+func (c *Conn) WriteMulti(codec CompressionCodec, reqs ...MultiProduceRequest) error {
+	// todo : validation?
+
+	produceVersion, err := c.negotiateVersion(produce, v2, v3, v7)
+	if err != nil {
+		return err
+	}
+
+	writeTime := time.Now()
+	var rbInput []produceInput
+	var msInput []messageSetProduceInput
+	if produceVersion == v2 {
+		msInput = make([]messageSetProduceInput, len(reqs))
+		for i, req := range reqs {
+			msInput[i] = messageSetProduceInput{
+				topic:      req.Topic,
+				partitions: make([]messageSetPartitionMessages, len(req.Partitions)),
+			}
+
+			for j, part := range req.Partitions {
+				for k, msg := range part.Messages {
+					if msg.Time.IsZero() {
+						part.Messages[k].Time = writeTime
+					}
+				}
+				msInput[i].partitions[j] = messageSetPartitionMessages{
+					partition: part.Partition,
+					messages:  part.Messages,
+				}
+			}
+		}
+	} else {
+		rbInput = make([]produceInput, len(reqs))
+		for i, req := range reqs {
+			rbInput[i] = produceInput{
+				topic:      req.Topic,
+				partitions: make([]partitionMessages, len(reqs[i].Partitions)),
+			}
+
+			for j, part := range req.Partitions {
+
+				for k, msg := range part.Messages {
+					if msg.Time.IsZero() {
+						part.Messages[k].Time = writeTime
+					}
+				}
+
+				rb, err := newRecordBatch(codec, reqs[i].Partitions[j].Messages...)
+				if err != nil {
+					return err
+				}
+
+				rbInput[i].partitions[j] = partitionMessages{
+					partition:   part.Partition,
+					recordBatch: rb,
+				}
+			}
+		}
+	}
+
+	return c.writeOperation(
+		func(deadline time.Time, id int32) error {
+			now := time.Now()
+			deadline = adjustDeadlineForRTT(deadline, now, defaultRTT)
+			switch produceVersion {
+			case v3, v7:
+				return c.wb.writeProduceRequest(
+					produceVersion,
+					id,
+					c.clientID,
+					deadlineToTimeout(deadline, now),
+					int16(atomic.LoadInt32(&c.requiredAcks)),
+					c.transactionalID,
+					rbInput...,
+				)
+			default:
+				return c.wb.writeProduceRequestV2(
+					codec,
+					id,
+					c.clientID,
+					deadlineToTimeout(deadline, now),
+					int16(atomic.LoadInt32(&c.requiredAcks)),
+					msInput...,
+				)
+			}
+		},
+		func(deadline time.Time, size int) error {
+			var mpErr MultiProduceError
+			remain, err := readArrayWith(&c.rbuf, size, func(r *bufio.Reader, size int) (remain int, err error) {
+				var topic string
+				if remain, err = readString(r, size, &topic); err != nil {
+					return remain, err
+				}
+
+				return readArrayWith(r, remain, func(r *bufio.Reader, size int) (remain int, err error) {
+					var partition int32
+					if remain, err = readInt32(&c.rbuf, size, &partition); err != nil {
+						return remain, err
+					}
+
+					// error code is the only thing we care about...if non-zero,
+					// then we have a partial failure scenario.
+					var errCode int16
+					if remain, err = readInt16(&c.rbuf, remain, &errCode); err != nil {
+						return remain, err
+					}
+					if errCode > 0 {
+						mpErr = append(mpErr, TopicPartitionError{
+							Topic:     topic,
+							Partition: partition,
+							Error:     Error(errCode),
+						})
+					}
+
+					// discard the offset
+					if remain, err = discardN(&c.rbuf, remain, 8); err != nil {
+						return remain, err
+					}
+
+					// discard the timestamp
+					if remain, err = discardN(&c.rbuf, remain, 8); err != nil {
+						return remain, err
+					}
+
+					// discard start offset.
+					if produceVersion >= v7 {
+						if remain, err = discardN(&c.rbuf, remain, 8); err != nil {
+							return remain, err
+						}
+					}
+
+					return remain, err
+				})
+			})
+			if err != nil {
+				return err
+			}
+
+			// discard throttle time
+			if err := expectZeroSize(discardInt32(&c.rbuf, remain)); err != nil {
+				return err
+			}
+
+			if len(mpErr) > 0 {
+				return mpErr
+			}
+			return nil
+		})
+}
+
 func (c *Conn) writeCompressedMessages(codec CompressionCodec, msgs ...Message) (nbytes int, partition int32, offset int64, appendTime time.Time, err error) {
 	if len(msgs) == 0 {
 		return
@@ -1159,7 +1332,7 @@ func (c *Conn) writeCompressedMessages(codec CompressionCodec, msgs ...Message) 
 			now := time.Now()
 			deadline = adjustDeadlineForRTT(deadline, now, defaultRTT)
 			switch produceVersion {
-			case v7:
+			case v3, v7:
 				recordBatch, err :=
 					newRecordBatch(
 						codec,
@@ -1168,45 +1341,40 @@ func (c *Conn) writeCompressedMessages(codec CompressionCodec, msgs ...Message) 
 				if err != nil {
 					return err
 				}
-				return c.wb.writeProduceRequestV7(
-					id,
-					c.clientID,
-					c.topic,
-					c.partition,
-					deadlineToTimeout(deadline, now),
-					int16(atomic.LoadInt32(&c.requiredAcks)),
-					c.transactionalID,
-					recordBatch,
-				)
-			case v3:
-				recordBatch, err :=
-					newRecordBatch(
-						codec,
-						msgs...,
-					)
-				if err != nil {
-					return err
+				// force stack allocation
+				var msgArr [1]partitionMessages
+				msgArr[0] = partitionMessages{
+					partition:   c.partition,
+					recordBatch: recordBatch,
 				}
-				return c.wb.writeProduceRequestV3(
+				return c.wb.writeProduceRequest(
+					produceVersion,
 					id,
 					c.clientID,
-					c.topic,
-					c.partition,
 					deadlineToTimeout(deadline, now),
 					int16(atomic.LoadInt32(&c.requiredAcks)),
 					c.transactionalID,
-					recordBatch,
+					produceInput{
+						topic:      c.topic,
+						partitions: msgArr[:],
+					},
 				)
 			default:
+				// force stack allocation
+				msgArr := [1]messageSetPartitionMessages{{
+					partition: c.partition,
+					messages:  msgs,
+				}}
 				return c.wb.writeProduceRequestV2(
 					codec,
 					id,
 					c.clientID,
-					c.topic,
-					c.partition,
 					deadlineToTimeout(deadline, now),
 					int16(atomic.LoadInt32(&c.requiredAcks)),
-					msgs...,
+					messageSetProduceInput{
+						topic:      c.topic,
+						partitions: msgArr[:],
+					},
 				)
 			}
 		},
