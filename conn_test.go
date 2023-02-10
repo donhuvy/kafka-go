@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"reflect"
+	"sort"
 	"strconv"
 	"testing"
 	"time"
@@ -522,7 +523,17 @@ func TestWriteMulti(t *testing.T) {
 		t.Fatal("expected two errors")
 	}
 
-	// todo : need to sort or is this deterministic??
+	// ordering is not guaranteed by the broker, so we need to sort
+	sort.Slice(mpErr, func(i, j int) bool {
+		if mpErr[i].Topic < mpErr[j].Topic {
+			return true
+		}
+		if mpErr[i].Topic > mpErr[j].Topic {
+			return false
+		}
+		return mpErr[i].Partition < mpErr[j].Partition
+	})
+
 	expected := MultiProduceError{
 		{
 			Topic:     "does-not-exist",

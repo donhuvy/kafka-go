@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1137,7 +1139,18 @@ type MultiProducePartition struct {
 type MultiProduceError []TopicPartitionError
 
 func (e MultiProduceError) Error() string {
-	return "make a better message" // todo
+	b := strings.Builder{}
+	for i, err := range e {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(err.Topic)
+		b.WriteByte(':')
+		b.WriteString(strconv.Itoa(int(err.Partition)))
+		b.WriteByte(' ')
+		b.WriteString(err.Error.Error())
+	}
+	return b.String()
 }
 
 type TopicPartitionError struct {
@@ -1148,71 +1161,44 @@ type TopicPartitionError struct {
 
 // todo : signature.
 func (c *Conn) WriteMulti(codec CompressionCodec, reqs ...MultiProduceRequest) error {
-	// todo : validation?
-
 	produceVersion, err := c.negotiateVersion(produce, v2, v3, v7)
 	if err != nil {
 		return err
 	}
 
 	writeTime := time.Now()
-	var rbInput []produceInput
-	var msInput []messageSetProduceInput
-	if produceVersion == v2 {
-		msInput = make([]messageSetProduceInput, len(reqs))
-		for i, req := range reqs {
-			msInput[i] = messageSetProduceInput{
-				topic:      req.Topic,
-				partitions: make([]messageSetPartitionMessages, len(req.Partitions)),
-			}
-
-			for j, part := range req.Partitions {
-				for k, msg := range part.Messages {
-					if msg.Time.IsZero() {
-						part.Messages[k].Time = writeTime
-					}
-				}
-				msInput[i].partitions[j] = messageSetPartitionMessages{
-					partition: part.Partition,
-					messages:  part.Messages,
-				}
-			}
-		}
-	} else {
-		rbInput = make([]produceInput, len(reqs))
-		for i, req := range reqs {
-			rbInput[i] = produceInput{
-				topic:      req.Topic,
-				partitions: make([]partitionMessages, len(reqs[i].Partitions)),
-			}
-
-			for j, part := range req.Partitions {
-
-				for k, msg := range part.Messages {
-					if msg.Time.IsZero() {
-						part.Messages[k].Time = writeTime
-					}
-				}
-
-				rb, err := newRecordBatch(codec, reqs[i].Partitions[j].Messages...)
-				if err != nil {
-					return err
-				}
-
-				rbInput[i].partitions[j] = partitionMessages{
-					partition:   part.Partition,
-					recordBatch: rb,
-				}
-			}
-		}
-	}
-
 	return c.writeOperation(
 		func(deadline time.Time, id int32) error {
 			now := time.Now()
 			deadline = adjustDeadlineForRTT(deadline, now, defaultRTT)
 			switch produceVersion {
 			case v3, v7:
+				input := make([]produceInput, len(reqs))
+				for i, req := range reqs {
+					input[i] = produceInput{
+						topic:      req.Topic,
+						partitions: make([]partitionMessages, len(reqs[i].Partitions)),
+					}
+
+					for j, part := range req.Partitions {
+						for k, msg := range part.Messages {
+							if msg.Time.IsZero() {
+								part.Messages[k].Time = writeTime
+							}
+						}
+
+						rb, err := newRecordBatch(codec, reqs[i].Partitions[j].Messages...)
+						if err != nil {
+							return err
+						}
+
+						input[i].partitions[j] = partitionMessages{
+							partition:   part.Partition,
+							recordBatch: rb,
+						}
+					}
+				}
+
 				return c.wb.writeProduceRequest(
 					produceVersion,
 					id,
@@ -1220,16 +1206,36 @@ func (c *Conn) WriteMulti(codec CompressionCodec, reqs ...MultiProduceRequest) e
 					deadlineToTimeout(deadline, now),
 					int16(atomic.LoadInt32(&c.requiredAcks)),
 					c.transactionalID,
-					rbInput...,
+					input...,
 				)
 			default:
+				input := make([]messageSetProduceInput, len(reqs))
+				for i, req := range reqs {
+					input[i] = messageSetProduceInput{
+						topic:      req.Topic,
+						partitions: make([]messageSetPartitionMessages, len(req.Partitions)),
+					}
+
+					for j, part := range req.Partitions {
+						for k, msg := range part.Messages {
+							if msg.Time.IsZero() {
+								part.Messages[k].Time = writeTime
+							}
+						}
+						input[i].partitions[j] = messageSetPartitionMessages{
+							partition: part.Partition,
+							messages:  part.Messages,
+						}
+					}
+				}
+
 				return c.wb.writeProduceRequestV2(
 					codec,
 					id,
 					c.clientID,
 					deadlineToTimeout(deadline, now),
 					int16(atomic.LoadInt32(&c.requiredAcks)),
-					msInput...,
+					input...,
 				)
 			}
 		},
@@ -1293,6 +1299,7 @@ func (c *Conn) WriteMulti(codec CompressionCodec, reqs ...MultiProduceRequest) e
 			if len(mpErr) > 0 {
 				return mpErr
 			}
+
 			return nil
 		})
 }
