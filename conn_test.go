@@ -515,8 +515,8 @@ func TestWriteMulti(t *testing.T) {
 	if err == nil {
 		t.Fatal("should have failed with error")
 	}
-	mpErr, ok := err.(MultiProduceError)
-	if !ok {
+	var mpErr MultiProduceError
+	if !errors.As(err, &mpErr) {
 		t.Fatal("should have been a multi-produce error")
 	}
 	if len(mpErr) != 2 {
